@@ -12,13 +12,17 @@ ADGUARD_PASS="${ADGUARD_PASS:-password}"
 DNS_DOMAIN="${DNS_DOMAIN:-}"
 DRY_RUN=0
 VERBOSE=0
+ADDED=0
+UPDATED=0
+DELETED=0
+SKIPPED=0
 
-log()  { echo "[INFO] $*"; }
+log()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO] $*"; }
 
 # Fixed: return 0 to avoid exiting when set -e is active
-dbg()  { [ "$VERBOSE" -eq 1 ] && echo "[DBG ] $*" || true; }
+dbg()  { [ "$VERBOSE" -eq 1 ] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] [DBG ] $*" || true; }
 
-err()  { echo "[ERR ] $*" >&2; }
+err()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERR ] $*" >&2; }
 
 usage() {
   cat <<EOF
@@ -64,8 +68,10 @@ if ! command -v pvesh >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! curl -s ${AUTH} "${BASE_URL}/control/status" >/dev/null 2>&1; then
-  err "Cannot reach AdGuard at ${BASE_URL}/control/status"
+RESPONSE=$(curl -s -w "\n%{http_code}" ${AUTH} "${BASE_URL}/control/status")
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+if [ "$HTTP_CODE" != "200" ]; then
+  err "Cannot reach AdGuard at ${BASE_URL}/control/status (HTTP $HTTP_CODE)"
   exit 1
 fi
 
@@ -139,7 +145,7 @@ for row in $(echo "$RAW_REWRITES" | jq -r '.[] | @base64'); do
   CURRENT["$D"]="$A"
 done
 
-# --- sync: ADD and UPDATE only (NO DELETE) ---
+# --- PHASE 1: SYNC (ADD and UPDATE) ---
 for DOMAIN in "${!DESIRED[@]}"; do
   NEW_IP="${DESIRED[$DOMAIN]}"
   OLD_IP="${CURRENT[$DOMAIN]:-}"
@@ -148,36 +154,103 @@ for DOMAIN in "${!DESIRED[@]}"; do
     # add new entry
     if [ $DRY_RUN -eq 1 ]; then
       log "[DRY] add ${DOMAIN} -> ${NEW_IP}"
+      ADDED=$((ADDED + 1))
     else
       dbg "Adding ${DOMAIN} -> ${NEW_IP}"
-      curl -s -X POST ${AUTH} \
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X POST ${AUTH} \
         -H "Content-Type: application/json" \
         -d "{\"domain\":\"${DOMAIN}\",\"answer\":\"${NEW_IP}\"}" \
-        "${BASE_URL}/control/rewrite/add" >/dev/null
-      log "added ${DOMAIN} -> ${NEW_IP}"
+        "${BASE_URL}/control/rewrite/add")
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      if [ "$HTTP_CODE" = "200" ]; then
+        log "added ${DOMAIN} -> ${NEW_IP}"
+        ADDED=$((ADDED + 1))
+      else
+        err "failed to add ${DOMAIN} (HTTP $HTTP_CODE)"
+      fi
     fi
   elif [ "$OLD_IP" != "$NEW_IP" ]; then
     # update existing entry (delete old + add new)
     if [ $DRY_RUN -eq 1 ]; then
       log "[DRY] update ${DOMAIN}: ${OLD_IP} -> ${NEW_IP}"
+      UPDATED=$((UPDATED + 1))
     else
       dbg "Updating ${DOMAIN}: ${OLD_IP} -> ${NEW_IP}"
-      curl -s -X POST ${AUTH} \
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X POST ${AUTH} \
         -H "Content-Type: application/json" \
         -d "{\"domain\":\"${DOMAIN}\",\"answer\":\"${OLD_IP}\"}" \
-        "${BASE_URL}/control/rewrite/delete" >/dev/null
+        "${BASE_URL}/control/rewrite/delete")
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      if [ "$HTTP_CODE" != "200" ]; then
+        err "failed to delete old entry ${DOMAIN} (HTTP $HTTP_CODE)"
+        continue
+      fi
 
-      curl -s -X POST ${AUTH} \
+      RESPONSE=$(curl -s -w "\n%{http_code}" -X POST ${AUTH} \
         -H "Content-Type: application/json" \
         -d "{\"domain\":\"${DOMAIN}\",\"answer\":\"${NEW_IP}\"}" \
-        "${BASE_URL}/control/rewrite/add" >/dev/null
-
-      log "updated ${DOMAIN}: ${OLD_IP} -> ${NEW_IP}"
+        "${BASE_URL}/control/rewrite/add")
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      if [ "$HTTP_CODE" = "200" ]; then
+        log "updated ${DOMAIN}: ${OLD_IP} -> ${NEW_IP}"
+        UPDATED=$((UPDATED + 1))
+      else
+        err "failed to add new entry ${DOMAIN} (HTTP $HTTP_CODE)"
+      fi
     fi
   else
     dbg "unchanged ${DOMAIN} -> ${OLD_IP}"
   fi
 done
 
-log "Sync done. Manual DNS entries left untouched."
+# --- PHASE 2: DELETE entries in AdGuard that are NOT in DESIRED ---
+declare -a TO_DELETE
+for D in "${!CURRENT[@]}"; do
+  # if domain not present in DESIRED, mark for deletion
+  if [ -z "${DESIRED[$D]+_}" ]; then
+    TO_DELETE+=("$D")
+  fi
+done
+
+if [ ${#TO_DELETE[@]} -gt 0 ]; then
+  echo
+  log "Found ${#TO_DELETE[@]} AdGuard rewrite(s) not present in Proxmox list"
+
+  for d in "${TO_DELETE[@]}"; do
+    ip="${CURRENT[$d]}"
+    read -r -p "Delete ${d} -> ${ip}? [y/N] " RESP
+    
+    case "$RESP" in
+      [yY][eE][sS]|[yY])
+        if [ $DRY_RUN -eq 1 ]; then
+          log "[DRY] delete ${d} -> ${ip}"
+          DELETED=$((DELETED + 1))
+        else
+          dbg "Deleting ${d} -> ${ip}"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST ${AUTH} \
+            -H "Content-Type: application/json" \
+            -d "{\"domain\":\"${d}\",\"answer\":\"${ip}\"}" \
+            "${BASE_URL}/control/rewrite/delete")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_CODE" = "200" ]; then
+            log "deleted ${d} -> ${ip}"
+            DELETED=$((DELETED + 1))
+          else
+            err "failed to delete ${d} (HTTP $HTTP_CODE)"
+          fi
+        fi
+        ;;
+      *)
+        log "skipped ${d} -> ${ip}"
+        SKIPPED=$((SKIPPED + 1))
+        ;;
+    esac
+  done
+else
+  dbg "No AdGuard rewrites to delete."
+fi
+
+# --- COMPLETE ---
+echo
+log "Sync complete. Added: $ADDED, Updated: $UPDATED, Deleted: $DELETED, Skipped: $SKIPPED. Manual DNS entries left untouched."
 
